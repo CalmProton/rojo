@@ -2,9 +2,9 @@ use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
 use rbx_dom_weak::types::{Ref, Variant};
-use std::path::PathBuf;
 use std::{
-    fs,
+    fs, io,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -113,6 +113,28 @@ struct JobThreadContext {
     message_queue: Arc<MessageQueue<AppliedPatchSet>>,
 }
 
+/// A file system watcher can report an event after its path is removed.
+/// Canonicalize the nearest existing ancestor and restore the missing suffix.
+fn canonicalize_event_path(vfs: &Vfs, path: &Path) -> io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing_suffix = PathBuf::new();
+
+    loop {
+        if let Some(canonical_ancestor) = vfs.canonicalize(ancestor).with_not_found()? {
+            return Ok(canonical_ancestor.join(missing_suffix));
+        }
+
+        let (Some(parent), Some(file_name)) = (ancestor.parent(), ancestor.file_name()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("No existing parent path was found for {}", path.display()),
+            ));
+        };
+        missing_suffix = PathBuf::from(file_name).join(missing_suffix);
+        ancestor = parent;
+    }
+}
+
 impl JobThreadContext {
     /// Computes and applies patches to the DOM for a given file path.
     ///
@@ -168,16 +190,18 @@ impl JobThreadContext {
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
         let applied_patches = match event {
-            VfsEvent::Create(path) | VfsEvent::Write(path) => {
-                self.apply_patches(self.vfs.canonicalize(&path).unwrap())
-            }
-            VfsEvent::Remove(path) => {
-                // MemoFS does not track parent removals yet, so we can canonicalize
-                // the parent path safely and then append the removed path's file name.
-                let parent = path.parent().unwrap();
-                let file_name = path.file_name().unwrap();
-                let parent_normalized = self.vfs.canonicalize(parent).unwrap();
-                self.apply_patches(parent_normalized.join(file_name))
+            VfsEvent::Create(path) | VfsEvent::Remove(path) | VfsEvent::Write(path) => {
+                match canonicalize_event_path(&self.vfs, &path) {
+                    Ok(path) => self.apply_patches(path),
+                    Err(err) => {
+                        log::error!(
+                            "Could not process file event for {}: {}",
+                            path.display(),
+                            err
+                        );
+                        Vec::new()
+                    }
+                }
             }
             _ => {
                 log::warn!("Unhandled VFS event: {:?}", event);
@@ -382,4 +406,36 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
     };
 
     Some(applied_patch_set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_event_path;
+    use memofs::{InMemoryFs, Vfs, VfsSnapshot};
+    use std::path::PathBuf;
+
+    #[test]
+    fn canonicalizes_removed_path_when_parent_is_also_missing() {
+        let removed_path = PathBuf::from("/project/out/server/tests/fixtures/case.lua");
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/project/out/server",
+            VfsSnapshot::dir([(
+                "tests",
+                VfsSnapshot::dir([(
+                    "fixtures",
+                    VfsSnapshot::dir([("case.lua", VfsSnapshot::empty_file())]),
+                )]),
+            )]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+
+        vfs.remove_dir_all("/project/out/server/tests").unwrap();
+
+        assert_eq!(
+            canonicalize_event_path(&vfs, &removed_path).unwrap(),
+            removed_path
+        );
+    }
 }
