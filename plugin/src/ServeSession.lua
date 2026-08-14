@@ -12,6 +12,7 @@ local Promise = require(Packages.Promise)
 local Timer = require(script.Parent.Timer)
 
 local ChangeBatcher = require(script.Parent.ChangeBatcher)
+local ConnectionError = require(script.Parent.ConnectionError)
 local encodePatchUpdate = require(script.Parent.ChangeBatcher.encodePatchUpdate)
 local InstanceMap = require(script.Parent.InstanceMap)
 local PatchSet = require(script.Parent.PatchSet)
@@ -63,6 +64,7 @@ ServeSession.Status = Status
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
+	expectedProjectName = t.optional(t.string),
 })
 
 function ServeSession.new(options)
@@ -101,6 +103,7 @@ function ServeSession.new(options)
 		__status = Status.NotStarted,
 		__apiContext = options.apiContext,
 		__twoWaySync = options.twoWaySync,
+		__expectedProjectName = options.expectedProjectName,
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
 		__changeBatcher = changeBatcher,
@@ -196,6 +199,14 @@ function ServeSession:start()
 	self.__apiContext
 		:connect()
 		:andThen(function(serverInfo)
+			if self.__expectedProjectName ~= nil and serverInfo.projectName ~= self.__expectedProjectName then
+				local message = (
+					"The server at this address now serves project '%s' instead of '%s'. Connect manually to confirm the new project."
+				):format(serverInfo.projectName, self.__expectedProjectName)
+
+				return Promise.reject(ConnectionError.nonRetryable(ConnectionError.Kind.ServerIdentity, message))
+			end
+
 			self:setLoadingText("Loading initial data from server...")
 			return self:__initialSync(serverInfo):andThen(function()
 				self:setLoadingText("Starting sync loop...")
@@ -220,7 +231,7 @@ function ServeSession:start()
 		end)
 		:catch(function(err)
 			if self.__status ~= Status.Disconnected then
-				self:__stopInternal(err)
+				self:__stopInternal(ConnectionError.nonRetryable(ConnectionError.Kind.Sync, err))
 			end
 		end)
 end

@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Fixed the Studio plugin requiring a manual reconnect after an unexpected WebSocket connection failure.
 * Fixed `rojo serve` crashing when a recursive directory removal reports a descendant after its parent is gone.
 * Fixed `$path` values that point outside the project folder failing to match `syncRule`s on Windows, which broke `rojo sourcemap` with a "could not be turned into a Roblox Instance" error. ([#1290])
 * Fixed `rojo serve` silently stopping syncing file changes on Windows when the served project path was a verbatim (`\\?\`) path, because tree paths and file-watcher event paths were canonicalized to different forms. ([#1290])

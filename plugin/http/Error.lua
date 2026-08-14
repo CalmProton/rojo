@@ -24,18 +24,23 @@ setmetatable(Error.Kind, {
 	end,
 })
 
-function Error.new(type, extraMessage)
+function Error.new(type, extraMessage, response)
 	extraMessage = extraMessage or ""
 	local message = type.message:gsub("{{message}}", extraMessage)
 
 	local err = {
 		type = type,
 		message = message,
+		response = response,
 	}
 
 	setmetatable(err, Error)
 
 	return err
+end
+
+function Error.is(value)
+	return getmetatable(value) == Error
 end
 
 function Error:__tostring()
@@ -66,10 +71,14 @@ end
 function Error.fromResponse(response)
 	local lower = (response.body or ""):lower()
 	if response.code == 408 or response.code == 504 or lower:find("timed? ?out") then
-		return Error.new(Error.Kind.Timeout)
+		return Error.new(Error.Kind.Timeout, nil, response)
 	end
 
-	return Error.new(Error.Kind.Unknown, string.format("%s: %s", tostring(response.code), tostring(response.body)))
+	return Error.new(
+		Error.Kind.Unknown,
+		string.format("%s: %s", tostring(response.code), tostring(response.body)),
+		response
+	)
 end
 
 return Error

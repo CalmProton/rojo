@@ -14,9 +14,12 @@ local Promise = require(Packages.Promise)
 local Assets = require(Plugin.Assets)
 local Version = require(Plugin.Version)
 local Config = require(Plugin.Config)
+local ConnectionIntent = require(Plugin.ConnectionIntent)
 local Settings = require(Plugin.Settings)
 local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
+local ReconnectController = require(Plugin.ReconnectController)
+local ReconnectPolicy = require(Plugin.ReconnectPolicy)
 local ServeSession = require(Plugin.ServeSession)
 local ApiContext = require(Plugin.ApiContext)
 local PatchSet = require(Plugin.PatchSet)
@@ -50,12 +53,38 @@ local e = Roact.createElement
 
 local App = Roact.Component:extend("App")
 
+local function makeConnectionTarget(host, port, projectName)
+	return {
+		host = host,
+		port = port,
+		projectName = projectName,
+		key = string.format("%s\0%s", host, port),
+	}
+end
+
 function App:init()
 	preloadAssets()
 
+	self.reconnectController = ReconnectController.new({
+		delaySeconds = 5,
+		connect = function(target)
+			self:startSession(target)
+		end,
+	})
+
 	local priorSyncInfo = self:getPriorSyncInfo()
-	self.host, self.setHost = Roact.createBinding(priorSyncInfo.host or "")
-	self.port, self.setPort = Roact.createBinding(priorSyncInfo.port or "")
+	local host, setHost = Roact.createBinding(priorSyncInfo.host or "")
+	local port, setPort = Roact.createBinding(priorSyncInfo.port or "")
+	self.host = host
+	self.port = port
+	self.setHost = function(value)
+		self:cancelReconnect(true)
+		setHost(value)
+	end
+	self.setPort = function(value)
+		self:cancelReconnect(true)
+		setPort(value)
+	end
 
 	self.confirmationBindable = Instance.new("BindableEvent")
 	self.confirmationEvent = self.confirmationBindable.Event
@@ -123,6 +152,11 @@ function App:init()
 	self.disconnectPrereleasesCheckChanged = Settings:onChanged("checkForPrereleases", function()
 		self:checkForUpdates()
 	end)
+	self.disconnectAutoReconnectChanged = Settings:onChanged("autoReconnect", function(enabled)
+		if not enabled then
+			self:cancelReconnect(false)
+		end
+	end)
 
 	self:setState({
 		appStatus = AppStatus.NotConnected,
@@ -174,6 +208,7 @@ function App:init()
 end
 
 function App:willUnmount()
+	self.isUnmounting = true
 	self:endSession()
 
 	self.waypointConnection:Disconnect()
@@ -181,6 +216,7 @@ function App:willUnmount()
 
 	self.disconnectUpdatesCheckChanged()
 	self.disconnectPrereleasesCheckChanged()
+	self.disconnectAutoReconnectChanged()
 	if self.disconnectSyncReminderPollingChanged then
 		self.disconnectSyncReminderPollingChanged()
 	end
@@ -189,6 +225,40 @@ function App:willUnmount()
 
 	self.autoConnectPlaytestServerListener()
 	self:clearRunningConnectionInfo()
+end
+
+function App:cleanupSessionHooks()
+	if self.cleanupPrecommit ~= nil then
+		self.cleanupPrecommit()
+		self.cleanupPrecommit = nil
+	end
+	if self.cleanupPostcommit ~= nil then
+		self.cleanupPostcommit()
+		self.cleanupPostcommit = nil
+	end
+end
+
+function App:cancelReconnect(clearTarget)
+	local hadPendingWork = self.reconnectController:hasPendingWork()
+	local attemptInFlight = self.reconnectController:isAttemptInFlight()
+	self.reconnectController:cancel()
+	if clearTarget then
+		self.lastValidConnectionTarget = nil
+	end
+
+	if attemptInFlight and self.serveSession ~= nil then
+		self:endSession()
+	elseif hadPendingWork then
+		self:setState({
+			appStatus = AppStatus.NotConnected,
+			toolbarIcon = Assets.Images.PluginButton,
+		})
+	end
+end
+
+function App:getConnectionIntent()
+	local sessionStatus = if self.serveSession ~= nil then self.serveSession:getStatus() else nil
+	return ConnectionIntent.resolve(sessionStatus, self.reconnectController:hasPendingWork())
 end
 
 function App:addNotification(notif: {
@@ -600,7 +670,20 @@ function App:useRunningConnectionInfo()
 	self.setPort(port)
 end
 
-function App:startSession()
+function App:startSession(reconnectTarget)
+	if reconnectTarget == nil then
+		self.reconnectController:cancel()
+	elseif reconnectTarget.key ~= makeConnectionTarget(self:getHostAndPort()).key then
+		Log.trace("Reconnect target changed before the next attempt")
+		self.reconnectController:cancel()
+		return
+	end
+
+	if self.serveSession ~= nil and self.serveSession:getStatus() ~= ServeSession.Status.NotStarted then
+		Log.trace("Skipping connection because a session is already active")
+		return
+	end
+
 	local claimedLock, priorOwner = self:claimSyncLock()
 	if not claimedLock then
 		local msg = string.format("Could not sync because user '%s' is already syncing", tostring(priorOwner))
@@ -615,11 +698,17 @@ function App:startSession()
 			errorMessage = msg,
 			toolbarIcon = Assets.Images.PluginButtonWarning,
 		})
+		self.reconnectController:cancel()
 
 		return
 	end
 
-	local host, port = self:getHostAndPort()
+	local host, port
+	if reconnectTarget ~= nil then
+		host, port = reconnectTarget.host, reconnectTarget.port
+	else
+		host, port = self:getHostAndPort()
+	end
 
 	local baseUrl = if string.find(host, "^https?://")
 		then string.format("%s:%s", host, port)
@@ -629,6 +718,7 @@ function App:startSession()
 	local serveSession = ServeSession.new({
 		apiContext = apiContext,
 		twoWaySync = Settings:get("twoWaySync"),
+		expectedProjectName = if reconnectTarget ~= nil then reconnectTarget.projectName else nil,
 	})
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
@@ -670,6 +760,7 @@ function App:startSession()
 		end)
 	end)
 
+	local hasConnected = false
 	serveSession:onStatusChanged(function(status, details)
 		if status == ServeSession.Status.Connecting then
 			if self.dismissSyncReminder then
@@ -685,6 +776,9 @@ function App:startSession()
 				text = "Connecting to session...",
 			})
 		elseif status == ServeSession.Status.Connected then
+			hasConnected = true
+			self.reconnectController:cancel()
+			self.lastValidConnectionTarget = makeConnectionTarget(host, port, details)
 			self.knownProjects[details] = true
 			self:setPriorSyncInfo(host, port, details)
 			self:setRunningConnectionInfo(baseUrl)
@@ -703,6 +797,7 @@ function App:startSession()
 			self.serveSession = nil
 			self:releaseSyncLock()
 			self:clearRunningConnectionInfo()
+			self:cleanupSessionHooks()
 			self:setState({
 				patchData = {
 					patch = PatchSet.newEmpty(),
@@ -711,9 +806,39 @@ function App:startSession()
 				},
 			})
 
-			-- Details being present indicates that this
-			-- disconnection was from an error.
-			if details ~= nil then
+			local retryTarget = self.lastValidConnectionTarget
+			local canRetry = ReconnectPolicy.shouldRetry({
+				error = details,
+				enabled = Settings:get("autoReconnect"),
+				disconnectRequested = self.disconnectRequested == true,
+				unloading = self.isUnmounting == true,
+				target = retryTarget,
+				currentTargetKey = makeConnectionTarget(self:getHostAndPort()).key,
+			})
+
+			if canRetry then
+				local scheduled
+				if reconnectTarget ~= nil and not hasConnected then
+					scheduled = self.reconnectController:attemptFailed(reconnectTarget)
+				else
+					scheduled = self.reconnectController:schedule(retryTarget)
+				end
+
+				if scheduled then
+					Log.warn("Connection lost: {}. Reconnecting in five seconds.", details)
+					self:setState({
+						appStatus = AppStatus.Connecting,
+						connectingText = "Connection lost. Reconnecting in 5 seconds...",
+						toolbarIcon = Assets.Images.PluginButton,
+					})
+					self:addNotification({
+						text = "Connection lost. Reconnecting in 5 seconds...",
+						timeout = 5,
+					})
+				end
+			elseif details ~= nil then
+				self.reconnectController:cancel()
+				self.lastValidConnectionTarget = nil
 				Log.warn("Disconnected from an error: {}", details)
 
 				self:setState({
@@ -726,6 +851,8 @@ function App:startSession()
 					timeout = 10,
 				})
 			else
+				self.reconnectController:cancel()
+				self.lastValidConnectionTarget = nil
 				self:setState({
 					appStatus = AppStatus.NotConnected,
 					toolbarIcon = Assets.Images.PluginButton,
@@ -830,7 +957,18 @@ function App:startSession()
 end
 
 function App:endSession()
+	self.disconnectRequested = true
+	self.reconnectController:cancel()
+	self.lastValidConnectionTarget = nil
+
 	if self.serveSession == nil then
+		if not self.isUnmounting then
+			self:setState({
+				appStatus = AppStatus.NotConnected,
+				toolbarIcon = Assets.Images.PluginButton,
+			})
+		end
+		self.disconnectRequested = false
 		return
 	end
 
@@ -841,13 +979,8 @@ function App:endSession()
 	self:setState({
 		appStatus = AppStatus.NotConnected,
 	})
-
-	if self.cleanupPrecommit ~= nil then
-		self.cleanupPrecommit()
-	end
-	if self.cleanupPostcommit ~= nil then
-		self.cleanupPostcommit()
-	end
+	self:cleanupSessionHooks()
+	self.disconnectRequested = false
 
 	Log.trace("Session terminated by user")
 end
@@ -1000,11 +1133,10 @@ function App:render()
 				icon = Assets.Images.PluginButton,
 				bindable = true,
 				onTriggered = function()
-					if self.serveSession == nil or self.serveSession:getStatus() == ServeSession.Status.NotStarted then
+					local intent = self:getConnectionIntent()
+					if intent == ConnectionIntent.Connect then
 						self:startSession()
-					elseif
-						self.serveSession ~= nil and self.serveSession:getStatus() == ServeSession.Status.Connected
-					then
+					elseif intent == ConnectionIntent.Disconnect then
 						self:endSession()
 					end
 				end,
@@ -1017,7 +1149,8 @@ function App:render()
 				icon = Assets.Images.PluginButton,
 				bindable = true,
 				onTriggered = function()
-					if self.serveSession == nil or self.serveSession:getStatus() == ServeSession.Status.NotStarted then
+					local intent = self:getConnectionIntent()
+					if intent == ConnectionIntent.Connect then
 						self:startSession()
 					end
 				end,
@@ -1030,7 +1163,8 @@ function App:render()
 				icon = Assets.Images.PluginButton,
 				bindable = true,
 				onTriggered = function()
-					if self.serveSession ~= nil and self.serveSession:getStatus() == ServeSession.Status.Connected then
+					local intent = self:getConnectionIntent()
+					if intent == ConnectionIntent.Disconnect then
 						self:endSession()
 					end
 				end,

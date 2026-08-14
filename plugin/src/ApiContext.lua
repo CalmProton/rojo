@@ -5,6 +5,8 @@ local Log = require(Packages.Log)
 local Promise = require(Packages.Promise)
 
 local Config = require(script.Parent.Config)
+local ConnectionError = require(script.Parent.ConnectionError)
+local HttpConnectionError = require(script.Parent.HttpConnectionError)
 local Types = require(script.Parent.Types)
 local Version = require(script.Parent.Version)
 
@@ -14,14 +16,8 @@ local validateApiSocketPacket = Types.ifEnabled(Types.ApiSocketPacket)
 local validateApiSerialize = Types.ifEnabled(Types.ApiSerializeResponse)
 local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
 
-local function rejectFailedRequests(response)
-	if response.code >= 400 then
-		local message = string.format("HTTP %s:\n%s", tostring(response.code), response.body)
-
-		return Promise.reject(message)
-	end
-
-	return response
+local function rejectTransportError(err)
+	return Promise.reject(HttpConnectionError.classify(err))
 end
 
 local function rejectWrongProtocolVersion(infoResponseBody)
@@ -40,7 +36,7 @@ local function rejectWrongProtocolVersion(infoResponseBody)
 			infoResponseBody.protocolVersion
 		)
 
-		return Promise.reject(message)
+		return Promise.reject(ConnectionError.nonRetryable(ConnectionError.Kind.Protocol, message))
 	end
 
 	return Promise.resolve(infoResponseBody)
@@ -63,7 +59,7 @@ local function rejectWrongPlaceId(infoResponseBody)
 				.. "\n\nTo change this list, edit 'servePlaceIds' in your .project.json file."
 			):format(game.PlaceId, table.concat(idList, "\n"))
 
-			return Promise.reject(message)
+			return Promise.reject(ConnectionError.nonRetryable(ConnectionError.Kind.Place, message))
 		end
 	end
 
@@ -83,7 +79,7 @@ local function rejectWrongPlaceId(infoResponseBody)
 				.. "\n\nTo change this list, edit 'blockedPlaceIds' in your .project.json file."
 			):format(game.PlaceId, table.concat(idList, "\n"))
 
-			return Promise.reject(message)
+			return Promise.reject(ConnectionError.nonRetryable(ConnectionError.Kind.Place, message))
 		end
 	end
 
@@ -144,7 +140,7 @@ function ApiContext:connect()
 	local url = ("%s/api/rojo"):format(self.__baseUrl)
 
 	return Http.get(url)
-		:andThen(rejectFailedRequests)
+		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(rejectWrongProtocolVersion)
 		:andThen(function(body)
@@ -163,15 +159,18 @@ end
 function ApiContext:read(ids)
 	local url = ("%s/api/read/%s"):format(self.__baseUrl, table.concat(ids, ","))
 
-	return Http.get(url):andThen(rejectFailedRequests):andThen(Http.Response.msgpack):andThen(function(body)
-		if body.sessionId ~= self.__sessionId then
-			return Promise.reject("Server changed ID")
-		end
+	return Http.get(url)
+		:catch(rejectTransportError)
+		:andThen(Http.Response.msgpack)
+		:andThen(function(body)
+			if body.sessionId ~= self.__sessionId then
+				return Promise.reject("Server changed ID")
+			end
 
-		assert(validateApiRead(body))
+			assert(validateApiRead(body))
 
-		return body
-	end)
+			return body
+		end)
 end
 
 function ApiContext:write(patch)
@@ -209,7 +208,7 @@ function ApiContext:write(patch)
 	body = Http.msgpackEncode(body)
 
 	return Http.post(url, body)
-		:andThen(rejectFailedRequests)
+		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(responseBody)
 			Log.info("Write response: {:?}", responseBody)
@@ -229,7 +228,12 @@ function ApiContext:connectWebSocket(packetHandlers)
 				Url = url,
 			})
 		if not success then
-			reject("Failed to create WebSocket client: " .. tostring(wsClient))
+			reject(
+				ConnectionError.retryable(
+					ConnectionError.Kind.WebSocketTransport,
+					"Failed to create WebSocket client: " .. tostring(wsClient)
+				)
+			)
 			return
 		end
 		self.__wsClient = wsClient
@@ -264,7 +268,12 @@ function ApiContext:connectWebSocket(packetHandlers)
 			received:Disconnect()
 
 			if self.__connected then
-				reject("WebSocket connection closed unexpectedly")
+				reject(
+					ConnectionError.retryable(
+						ConnectionError.Kind.WebSocketTransport,
+						"WebSocket connection closed unexpectedly"
+					)
+				)
 			else
 				resolve()
 			end
@@ -275,7 +284,12 @@ function ApiContext:connectWebSocket(packetHandlers)
 			errored:Disconnect()
 			received:Disconnect()
 
-			reject("WebSocket error: " .. code .. " - " .. msg)
+			reject(
+				ConnectionError.retryable(
+					ConnectionError.Kind.WebSocketTransport,
+					"WebSocket error: " .. code .. " - " .. msg
+				)
+			)
 		end)
 	end)
 end
@@ -283,13 +297,16 @@ end
 function ApiContext:open(id)
 	local url = ("%s/api/open/%s"):format(self.__baseUrl, id)
 
-	return Http.post(url, ""):andThen(rejectFailedRequests):andThen(Http.Response.msgpack):andThen(function(body)
-		if body.sessionId ~= self.__sessionId then
-			return Promise.reject("Server changed ID")
-		end
+	return Http.post(url, "")
+		:catch(rejectTransportError)
+		:andThen(Http.Response.msgpack)
+		:andThen(function(body)
+			if body.sessionId ~= self.__sessionId then
+				return Promise.reject("Server changed ID")
+			end
 
-		return nil
-	end)
+			return nil
+		end)
 end
 
 function ApiContext:serialize(ids: { string })
@@ -297,7 +314,7 @@ function ApiContext:serialize(ids: { string })
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
 	return Http.post(url, request_body)
-		:andThen(rejectFailedRequests)
+		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(response_body)
 			if response_body.sessionId ~= self.__sessionId then
@@ -315,7 +332,7 @@ function ApiContext:refPatch(ids: { string })
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
 	return Http.post(url, request_body)
-		:andThen(rejectFailedRequests)
+		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(response_body)
 			if response_body.sessionId ~= self.__sessionId then

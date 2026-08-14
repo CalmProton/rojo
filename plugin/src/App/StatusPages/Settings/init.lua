@@ -98,7 +98,7 @@ function SettingsPage:render()
 			AutoReconnect = e(Setting, {
 				id = "autoReconnect",
 				name = "Auto Reconnect",
-				description = "Reconnect to server on place open if the served project matches the last sync to the place",
+				description = "Reconnect on place open and after an unexpected connection loss",
 				transparency = self.props.transparency,
 				layoutOrder = layoutIncrement(),
 			}),
