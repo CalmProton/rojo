@@ -6,7 +6,7 @@ local Roact = require(Packages.Roact)
 
 local Theme = require(Plugin.App.Theme)
 local Assets = require(Plugin.Assets)
-local Config = require(Plugin.Config)
+local Branding = require(Plugin.Branding)
 local Version = require(Plugin.Version)
 
 local Tooltip = require(Plugin.App.Components.Tooltip)
@@ -53,7 +53,7 @@ local function VersionIndicator(props)
 				else nil,
 
 			VersionText = e("TextLabel", {
-				Text = Version.display(Config.version),
+				Text = Branding.displayName,
 				FontFace = theme.Font.Thin,
 				TextSize = theme.TextSize.Body,
 				TextColor3 = theme.Header.VersionColor,

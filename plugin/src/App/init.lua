@@ -13,14 +13,16 @@ local Log = require(Packages.Log)
 local Promise = require(Packages.Promise)
 
 local Assets = require(Plugin.Assets)
+local Branding = require(Plugin.Branding)
 local Version = require(Plugin.Version)
 local Config = require(Plugin.Config)
 local ConnectionIntent = require(Plugin.ConnectionIntent)
+local DisconnectDecision = require(Plugin.DisconnectDecision)
 local Settings = require(Plugin.Settings)
 local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
+local ReachabilityProbe = require(Plugin.ReachabilityProbe)
 local ReconnectController = require(Plugin.ReconnectController)
-local ReconnectPolicy = require(Plugin.ReconnectPolicy)
 local ServeSession = require(Plugin.ServeSession)
 local ApiContext = require(Plugin.ApiContext)
 local PatchSet = require(Plugin.PatchSet)
@@ -65,11 +67,32 @@ local function makeConnectionTarget(host, port, projectName)
 	}
 end
 
+local function makeBaseUrl(host, port)
+	return if string.find(host, "^https?://")
+		then string.format("%s:%s", host, port)
+		else string.format("http://%s:%s", host, port)
+end
+
+local function makeReachabilityUrl(target)
+	return (makeBaseUrl(target.host, target.port) .. "/api/socket/0")
+		:gsub("^http://", "ws://")
+		:gsub("^https://", "wss://")
+end
+
 function App:init()
 	preloadAssets()
 
 	self.reconnectController = ReconnectController.new({
 		delaySeconds = RECONNECT_INTERVAL_SECONDS,
+		probe = function(target, onOpened, onFailed)
+			local probe = ReachabilityProbe.new({
+				timeoutSeconds = RECONNECT_INTERVAL_SECONDS,
+			})
+			return probe:start(makeReachabilityUrl(target), onOpened, function(err)
+				Log.trace("Reconnect reachability probe failed: {}", err)
+				onFailed()
+			end)
+		end,
 		connect = function(target)
 			self:startSession(target)
 		end,
@@ -461,9 +484,7 @@ end
 
 function App:findActiveServer()
 	local host, port = self:getHostAndPort()
-	local baseUrl = if string.find(host, "^https?://")
-		then string.format("%s:%s", host, port)
-		else string.format("http://%s:%s", host, port)
+	local baseUrl = makeBaseUrl(host, port)
 
 	Log.trace("Checking for active sync server at {}", baseUrl)
 
@@ -487,24 +508,26 @@ function App:tryAutoReconnect()
 		return Promise.resolve(false)
 	end
 
-	return self:findActiveServer()
-		:andThen(function(serverInfo)
-			-- change
-			if serverInfo.projectName == priorSyncInfo.projectName then
-				Log.trace("Auto-reconnect found matching server, reconnecting...")
-				self:addNotification({
-					text = `Auto-reconnect discovered project '{serverInfo.projectName}'...`,
-				})
-				self:startSession()
-				return true
-			end
-			Log.trace("Auto-reconnect found different server, not reconnecting")
-			return false
-		end)
-		:catch(function()
-			Log.trace("Auto-reconnect did not find a server, not reconnecting")
-			return false
-		end)
+	local host, port = self:getHostAndPort()
+	local target = makeConnectionTarget(host, port, priorSyncInfo.projectName)
+	local scheduled, retryDelaySeconds = self.reconnectController:schedule(target)
+	if not scheduled then
+		return Promise.resolve(self.reconnectController:hasPendingWork())
+	end
+
+	self.lastValidConnectionTarget = target
+	local retryText = string.format("Reconnecting to '%s' in %.1f seconds...", target.projectName, retryDelaySeconds)
+	self:setState({
+		appStatus = AppStatus.Connecting,
+		connectingText = retryText,
+		toolbarIcon = Assets.Images.PluginButton,
+	})
+	self:addNotification({
+		text = retryText,
+		timeout = 5,
+	})
+
+	return Promise.resolve(true)
 end
 
 function App:checkSyncReminder()
@@ -715,11 +738,9 @@ function App:startSession(reconnectTarget)
 		host, port = self:getHostAndPort()
 	end
 
-	local baseUrl = if string.find(host, "^https?://")
-		then string.format("%s:%s", host, port)
-		else string.format("http://%s:%s", host, port)
-	-- RequestAsync has no public abort handle. The engine deadline prevents one
-	-- reconnect probe from blocking the single-flight controller indefinitely.
+	local baseUrl = makeBaseUrl(host, port)
+	-- The closeable WebSocket probe keeps down-server waits out of RequestAsync.
+	-- Keep the engine timeout as a secondary bound, not as a cancellation handle.
 	local apiContext = ApiContext.new(baseUrl, {
 		connectRequestLane = CONNECT_REQUEST_LANE,
 		connectTimeoutSeconds = if reconnectTarget ~= nil then RECONNECT_INTERVAL_SECONDS else nil,
@@ -817,7 +838,7 @@ function App:startSession(reconnectTarget)
 			})
 
 			local retryTarget = self.lastValidConnectionTarget
-			local canRetry = ReconnectPolicy.shouldRetry({
+			local disconnectDecision = DisconnectDecision.resolve({
 				error = details,
 				enabled = Settings:get("autoReconnect"),
 				disconnectRequested = self.disconnectRequested == true,
@@ -826,7 +847,7 @@ function App:startSession(reconnectTarget)
 				currentTargetKey = makeConnectionTarget(self:getHostAndPort()).key,
 			})
 
-			if canRetry then
+			if disconnectDecision == DisconnectDecision.Reconnect then
 				local scheduled, retryDelaySeconds
 				if reconnectTarget ~= nil and not hasConnected then
 					scheduled, retryDelaySeconds = self.reconnectController:attemptFailed(reconnectTarget)
@@ -834,22 +855,23 @@ function App:startSession(reconnectTarget)
 					scheduled, retryDelaySeconds = self.reconnectController:schedule(retryTarget)
 				end
 
-				if scheduled then
-					local retryText = if retryDelaySeconds > 0
+				local retryText = if scheduled and retryDelaySeconds > 0
 						then string.format("Connection lost. Reconnecting in %.1f seconds...", retryDelaySeconds)
-						else "Connection lost. Retrying now..."
+						else "Connection lost. Reconnecting..."
+				self:setState({
+					appStatus = AppStatus.Connecting,
+					connectingText = retryText,
+					toolbarIcon = Assets.Images.PluginButton,
+				})
+
+				if scheduled then
 					Log.warn("Connection lost: {}. {}", details, retryText)
-					self:setState({
-						appStatus = AppStatus.Connecting,
-						connectingText = retryText,
-						toolbarIcon = Assets.Images.PluginButton,
-					})
 					self:addNotification({
 						text = retryText,
 						timeout = 5,
 					})
 				end
-			elseif details ~= nil then
+			elseif disconnectDecision == DisconnectDecision.Error then
 				self.reconnectController:cancel()
 				self.lastValidConnectionTarget = nil
 				Log.warn("Disconnected from an error: {}", details)
@@ -1006,7 +1028,7 @@ function App:endSession()
 end
 
 function App:render()
-	local pluginName = "Rojo " .. Version.display(Config.version)
+	local pluginName = Branding.displayName
 
 	local function createPageElement(appStatus, additionalProps)
 		additionalProps = additionalProps or {}
@@ -1148,7 +1170,7 @@ function App:render()
 
 			toggleAction = e(StudioPluginAction, {
 				name = "RojoConnection",
-				title = "Rojo: Connect/Disconnect",
+				title = Branding.displayName .. ": Connect/Disconnect",
 				description = "Toggles the server for a Rojo sync session",
 				icon = Assets.Images.PluginButton,
 				bindable = true,
@@ -1164,7 +1186,7 @@ function App:render()
 
 			connectAction = e(StudioPluginAction, {
 				name = "RojoConnect",
-				title = "Rojo: Connect",
+				title = Branding.displayName .. ": Connect",
 				description = "Connects the server for a Rojo sync session",
 				icon = Assets.Images.PluginButton,
 				bindable = true,
@@ -1178,7 +1200,7 @@ function App:render()
 
 			disconnectAction = e(StudioPluginAction, {
 				name = "RojoDisconnect",
-				title = "Rojo: Disconnect",
+				title = Branding.displayName .. ": Disconnect",
 				description = "Disconnects the server for a Rojo sync session",
 				icon = Assets.Images.PluginButton,
 				bindable = true,
@@ -1195,7 +1217,7 @@ function App:render()
 			}, {
 				button = e(StudioToggleButton, {
 					name = "Rojo",
-					tooltip = "Show or hide the Rojo panel",
+					tooltip = "Show or hide " .. Branding.displayName,
 					icon = self.state.toolbarIcon,
 					active = self.state.guiEnabled,
 					enabled = true,
