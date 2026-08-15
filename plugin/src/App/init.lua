@@ -8,6 +8,7 @@ local Plugin = Rojo.Plugin
 local Packages = Rojo.Packages
 
 local Roact = require(Packages.Roact)
+local Http = require(Packages.Http)
 local Log = require(Packages.Log)
 local Promise = require(Packages.Promise)
 
@@ -52,6 +53,8 @@ local AppStatus = strict("AppStatus", {
 local e = Roact.createElement
 
 local App = Roact.Component:extend("App")
+local CONNECT_REQUEST_LANE = Http.RequestLane.new()
+local RECONNECT_INTERVAL_SECONDS = 5
 
 local function makeConnectionTarget(host, port, projectName)
 	return {
@@ -66,7 +69,7 @@ function App:init()
 	preloadAssets()
 
 	self.reconnectController = ReconnectController.new({
-		delaySeconds = 5,
+		delaySeconds = RECONNECT_INTERVAL_SECONDS,
 		connect = function(target)
 			self:startSession(target)
 		end,
@@ -464,7 +467,9 @@ function App:findActiveServer()
 
 	Log.trace("Checking for active sync server at {}", baseUrl)
 
-	local apiContext = ApiContext.new(baseUrl)
+	local apiContext = ApiContext.new(baseUrl, {
+		connectRequestLane = CONNECT_REQUEST_LANE,
+	})
 	return apiContext:connect():andThen(function(serverInfo)
 		apiContext:disconnect()
 		return serverInfo, host, port
@@ -713,7 +718,12 @@ function App:startSession(reconnectTarget)
 	local baseUrl = if string.find(host, "^https?://")
 		then string.format("%s:%s", host, port)
 		else string.format("http://%s:%s", host, port)
-	local apiContext = ApiContext.new(baseUrl)
+	-- RequestAsync has no public abort handle. The engine deadline prevents one
+	-- reconnect probe from blocking the single-flight controller indefinitely.
+	local apiContext = ApiContext.new(baseUrl, {
+		connectRequestLane = CONNECT_REQUEST_LANE,
+		connectTimeoutSeconds = if reconnectTarget ~= nil then RECONNECT_INTERVAL_SECONDS else nil,
+	})
 
 	local serveSession = ServeSession.new({
 		apiContext = apiContext,
@@ -817,22 +827,25 @@ function App:startSession(reconnectTarget)
 			})
 
 			if canRetry then
-				local scheduled
+				local scheduled, retryDelaySeconds
 				if reconnectTarget ~= nil and not hasConnected then
-					scheduled = self.reconnectController:attemptFailed(reconnectTarget)
+					scheduled, retryDelaySeconds = self.reconnectController:attemptFailed(reconnectTarget)
 				else
-					scheduled = self.reconnectController:schedule(retryTarget)
+					scheduled, retryDelaySeconds = self.reconnectController:schedule(retryTarget)
 				end
 
 				if scheduled then
-					Log.warn("Connection lost: {}. Reconnecting in five seconds.", details)
+					local retryText = if retryDelaySeconds > 0
+						then string.format("Connection lost. Reconnecting in %.1f seconds...", retryDelaySeconds)
+						else "Connection lost. Retrying now..."
+					Log.warn("Connection lost: {}. {}", details, retryText)
 					self:setState({
 						appStatus = AppStatus.Connecting,
-						connectingText = "Connection lost. Reconnecting in 5 seconds...",
+						connectingText = retryText,
 						toolbarIcon = Assets.Images.PluginButton,
 					})
 					self:addNotification({
-						text = "Connection lost. Reconnecting in 5 seconds...",
+						text = retryText,
 						timeout = 5,
 					})
 				end
@@ -948,7 +961,10 @@ function App:startSession(reconnectTarget)
 			timeout = 7,
 		})
 
-		return self.confirmationEvent:Wait()
+		self.isAwaitingConfirmation = true
+		local decision = self.confirmationEvent:Wait()
+		self.isAwaitingConfirmation = false
+		return decision
 	end)
 
 	serveSession:start()
@@ -960,6 +976,10 @@ function App:endSession()
 	self.disconnectRequested = true
 	self.reconnectController:cancel()
 	self.lastValidConnectionTarget = nil
+	if self.isAwaitingConfirmation then
+		self.confirmationBindable:Fire("Abort")
+		self.isAwaitingConfirmation = false
+	end
 
 	if self.serveSession == nil then
 		if not self.isUnmounting then

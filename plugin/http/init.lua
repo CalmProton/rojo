@@ -6,6 +6,8 @@ local Promise = require(script.Parent.Promise)
 
 local HttpError = require(script.Error)
 local HttpResponse = require(script.Response)
+local RequestLane = require(script.RequestLane)
+local RequestOptions = require(script.RequestOptions)
 
 local lastRequestId = 0
 
@@ -13,6 +15,7 @@ local Http = {}
 
 Http.Error = HttpError
 Http.Response = HttpResponse
+Http.RequestLane = RequestLane
 
 -- Monkey patch msgpack.UInt64.new to lossily convert the low and high bits of the integer
 -- to a native Luau number. We should change the upstream decoder to emit a native
@@ -21,7 +24,7 @@ function msgpack.UInt64.new(mostSignificantPart: number, leastSignificantPart: n
 	return (mostSignificantPart % 2 ^ 32) * 2 ^ 32 + (leastSignificantPart % 2 ^ 32)
 end
 
-local function performRequest(requestParams)
+local function startRequest(requestParams, resolve, reject, settle)
 	local requestId = lastRequestId + 1
 	lastRequestId = requestId
 
@@ -31,41 +34,54 @@ local function performRequest(requestParams)
 		Log.trace("{}", requestParams.Body)
 	end
 
-	return Promise.new(function(resolve, reject)
-		coroutine.wrap(function()
-			local success, response = pcall(function()
-				return HttpService:RequestAsync(requestParams)
-			end)
+	coroutine.wrap(function()
+		local success, response = pcall(function()
+			return HttpService:RequestAsync(requestParams)
+		end)
+		-- A cancelled Promise does not stop RequestAsync. Release the lane only
+		-- after the engine call returns, so a replacement request cannot overlap it.
+		settle()
 
-			if success then
-				Log.trace("Request {} success, response {:#?}", requestId, response)
-				local httpResponse = HttpResponse.fromRobloxResponse(response)
-				if httpResponse:isSuccess() then
-					resolve(httpResponse)
-				else
-					reject(HttpError.fromResponse(httpResponse))
-				end
+		if success then
+			Log.trace("Request {} success, response {:#?}", requestId, response)
+			local httpResponse = HttpResponse.fromRobloxResponse(response)
+			if httpResponse:isSuccess() then
+				resolve(httpResponse)
 			else
-				Log.trace("Request {} failure: {:?}", requestId, response)
-				reject(HttpError.fromRobloxErrorString(response))
+				reject(HttpError.fromResponse(httpResponse))
 			end
-		end)()
+		else
+			Log.trace("Request {} failure: {:?}", requestId, response)
+			reject(HttpError.fromRobloxErrorString(response))
+		end
+	end)()
+end
+
+local function performRequest(requestParams, requestLane)
+	if requestLane ~= nil then
+		return requestLane:request(function(resolve, reject, settle)
+			startRequest(requestParams, resolve, reject, settle)
+		end)
+	end
+
+	return Promise.new(function(resolve, reject)
+		startRequest(requestParams, resolve, reject, function() end)
 	end)
 end
 
-function Http.get(url)
-	return performRequest({
+function Http.get(url, options)
+	return performRequest(RequestOptions.apply({
 		Url = url,
 		Method = "GET",
-	})
+	}, options), if options ~= nil then options.requestLane else nil)
 end
 
-function Http.post(url, body)
-	return performRequest({
+function Http.post(url, body, options)
+	return performRequest(RequestOptions.apply({
 		Url = url,
 		Method = "POST",
 		Body = body,
-	})
+	}, options), if options ~= nil then options.requestLane else nil)
 end
 
 function Http.jsonEncode(object)

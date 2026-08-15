@@ -101,6 +101,7 @@ function ServeSession.new(options)
 
 	self = {
 		__status = Status.NotStarted,
+		__generation = 0,
 		__apiContext = options.apiContext,
 		__twoWaySync = options.twoWaySync,
 		__expectedProjectName = options.expectedProjectName,
@@ -150,6 +151,14 @@ function ServeSession:setLoadingText(text: string)
 	self.__updateLoadingText(text)
 end
 
+function ServeSession:__isActive(generation)
+	return self.__generation == generation and self.__status ~= Status.Disconnected
+end
+
+function ServeSession:__rejectInactive()
+	return Promise.reject("Connection was stopped.")
+end
+
 --[=[
 	Hooks a function to run before patch application.
 	The provided function is called with the incoming patch and an InstanceMap
@@ -193,12 +202,18 @@ function ServeSession:hookPostcommit(callback)
 end
 
 function ServeSession:start()
+	self.__generation += 1
+	local generation = self.__generation
 	self:__setStatus(Status.Connecting)
 	self:setLoadingText("Connecting to server...")
 
 	self.__apiContext
 		:connect()
 		:andThen(function(serverInfo)
+			if not self:__isActive(generation) then
+				return self:__rejectInactive()
+			end
+
 			if self.__expectedProjectName ~= nil and serverInfo.projectName ~= self.__expectedProjectName then
 				local message = (
 					"The server at this address now serves project '%s' instead of '%s'. Connect manually to confirm the new project."
@@ -208,29 +223,40 @@ function ServeSession:start()
 			end
 
 			self:setLoadingText("Loading initial data from server...")
-			return self:__initialSync(serverInfo):andThen(function()
+			return self:__initialSync(serverInfo, generation):andThen(function()
+				if not self:__isActive(generation) then
+					return self:__rejectInactive()
+				end
+
 				self:setLoadingText("Starting sync loop...")
+				self.__apiContext:finishConnecting()
 				self:__setStatus(Status.Connected, serverInfo.projectName)
+				if not self:__isActive(generation) then
+					return self:__rejectInactive()
+				end
+
 				self:__applyGameAndPlaceId(serverInfo)
 
 				return self.__apiContext:connectWebSocket({
 					["messages"] = function(messagesPacket)
-						if self.__status == Status.Disconnected then
+						if not self:__isActive(generation) or self.__status ~= Status.Connected then
 							return
 						end
 
 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
 						for _, message in messagesPacket.messages do
-							self:__applyPatch(message)
+							self:__applyPatch(message, generation)
 						end
-						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+						if self:__isActive(generation) then
+							self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+						end
 					end,
 				})
 			end)
 		end)
 		:catch(function(err)
-			if self.__status ~= Status.Disconnected then
+			if self:__isActive(generation) then
 				self:__stopInternal(ConnectionError.nonRetryable(ConnectionError.Kind.Sync, err))
 			end
 		end)
@@ -289,7 +315,11 @@ function ServeSession:__onActiveScriptChanged(activeScript)
 	self.__apiContext:open(scriptId)
 end
 
-function ServeSession:__replaceInstances(idList)
+function ServeSession:__replaceInstances(idList, generation)
+	if not self:__isActive(generation) then
+		return false
+	end
+
 	if #idList == 0 then
 		return true, PatchSet.newEmpty()
 	end
@@ -304,8 +334,15 @@ function ServeSession:__replaceInstances(idList)
 	local modelSuccess, replacements = self.__apiContext
 		:serialize(idList)
 		:andThen(function(response)
+			if not self:__isActive(generation) then
+				return self:__rejectInactive()
+			end
+
 			Log.debug("Deserializing results from serialize endpoint")
 			local objects = SerializationService:DeserializeInstancesAsync(response.modelContents)
+			if not self:__isActive(generation) then
+				return self:__rejectInactive()
+			end
 			if not objects[1] then
 				return Promise.reject("Serialize endpoint did not deserialize into any Instances")
 			end
@@ -321,6 +358,10 @@ function ServeSession:__replaceInstances(idList)
 		end)
 		:await()
 
+	if not self:__isActive(generation) then
+		return false
+	end
+
 	local refSuccess, refPatch = self.__apiContext
 		:refPatch(idList)
 		:andThen(function(response)
@@ -329,6 +370,9 @@ function ServeSession:__replaceInstances(idList)
 		:await()
 
 	if not (modelSuccess and refSuccess) then
+		return false
+	end
+	if not self:__isActive(generation) then
 		return false
 	end
 
@@ -356,6 +400,10 @@ function ServeSession:__replaceInstances(idList)
 	end
 
 	for _, swap in orderSwaps(swaps) do
+		if not self:__isActive(generation) then
+			return false
+		end
+
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
 		self.__instanceMap:insert(id, replacement)
@@ -406,6 +454,9 @@ function ServeSession:__replaceInstances(idList)
 		end
 	end
 
+	if not self:__isActive(generation) then
+		return false
+	end
 	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, refPatch)
 	if patchApplySuccess then
 		Selection:Set(selection)
@@ -415,7 +466,11 @@ function ServeSession:__replaceInstances(idList)
 	end
 end
 
-function ServeSession:__applyPatch(patch)
+function ServeSession:__applyPatch(patch, generation)
+	if not self:__isActive(generation) then
+		return
+	end
+
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording = ChangeHistoryService:TryBeginRecording("Rojo: Patch " .. patchTimestamp)
 	if not historyRecording then
@@ -433,6 +488,12 @@ function ServeSession:__applyPatch(patch)
 		end
 	end
 	Timer.stop()
+	if not self:__isActive(generation) then
+		if historyRecording then
+			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+		end
+		return
+	end
 
 	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, patch)
 	if not patchApplySuccess then
@@ -451,13 +512,25 @@ function ServeSession:__applyPatch(patch)
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.added)")
 		Timer.start("ServeSession:__replaceInstances(unappliedPatch.added)")
-		local addSuccess, unappliedAddedRefs = self:__replaceInstances(addedIdList)
+		local addSuccess, unappliedAddedRefs = self:__replaceInstances(addedIdList, generation)
 		Timer.stop()
+		if not self:__isActive(generation) then
+			if historyRecording then
+				ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+			end
+			return
+		end
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.updated)")
 		Timer.start("ServeSession:__replaceInstances(unappliedPatch.updated)")
-		local updateSuccess, unappliedUpdateRefs = self:__replaceInstances(updatedIdList)
+		local updateSuccess, unappliedUpdateRefs = self:__replaceInstances(updatedIdList, generation)
 		Timer.stop()
+		if not self:__isActive(generation) then
+			if historyRecording then
+				ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+			end
+			return
+		end
 
 		-- Update the unapplied patch to reflect which Instances were replaced successfully
 		if addSuccess then
@@ -482,6 +555,10 @@ function ServeSession:__applyPatch(patch)
 	-- guaranteed to be called after the commit
 	for _, callback in self.__postcommitCallbacks do
 		task.spawn(function()
+			if not self:__isActive(generation) then
+				return
+			end
+
 			local success, err = pcall(callback, patch, self.__instanceMap, unappliedPatch)
 			if not success then
 				Log.warn("Postcommit hook errored: {}", err)
@@ -495,8 +572,12 @@ function ServeSession:__applyPatch(patch)
 	end
 end
 
-function ServeSession:__initialSync(serverInfo)
+function ServeSession:__initialSync(serverInfo, generation)
 	return self.__apiContext:read({ serverInfo.rootInstanceId }):andThen(function(readResponseBody)
+		if not self:__isActive(generation) then
+			return self:__rejectInactive()
+		end
+
 		-- Tell the API Context that we're up-to-date with the version of
 		-- the tree defined in this response.
 		self.__apiContext:setMessageCursor(readResponseBody.messageCursor)
@@ -537,6 +618,9 @@ function ServeSession:__initialSync(serverInfo)
 		if self.__userConfirmCallback ~= nil then
 			userDecision = self.__userConfirmCallback(self.__instanceMap, catchUpPatch, serverInfo)
 		end
+		if not self:__isActive(generation) then
+			return self:__rejectInactive()
+		end
 
 		if userDecision == "Abort" then
 			return Promise.reject("Aborted Rojo sync operation")
@@ -569,9 +653,18 @@ function ServeSession:__initialSync(serverInfo)
 				table.insert(inversePatch.removed, id)
 			end
 
+			if not self:__isActive(generation) then
+				return self:__rejectInactive()
+			end
 			return self.__apiContext:write(inversePatch)
 		elseif userDecision == "Accept" then
-			self:__applyPatch(catchUpPatch)
+			if not self:__isActive(generation) then
+				return self:__rejectInactive()
+			end
+			self:__applyPatch(catchUpPatch, generation)
+			if not self:__isActive(generation) then
+				return self:__rejectInactive()
+			end
 			return Promise.resolve()
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)
@@ -580,6 +673,11 @@ function ServeSession:__initialSync(serverInfo)
 end
 
 function ServeSession:__stopInternal(err)
+	if self.__status == Status.Disconnected then
+		return
+	end
+
+	self.__generation += 1
 	self:__setStatus(Status.Disconnected, err)
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()

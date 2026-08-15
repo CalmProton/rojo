@@ -20,6 +20,10 @@ local function rejectTransportError(err)
 	return Promise.reject(HttpConnectionError.classify(err))
 end
 
+local function disconnectedError()
+	return ConnectionError.nonRetryable(ConnectionError.Kind.Sync, "Connection was stopped.")
+end
+
 local function rejectWrongProtocolVersion(infoResponseBody)
 	if infoResponseBody.protocolVersion ~= Config.protocolVersion then
 		local message = (
@@ -89,11 +93,28 @@ end
 local ApiContext = {}
 ApiContext.__index = ApiContext
 
-function ApiContext.new(baseUrl)
+function ApiContext.new(baseUrl, options)
 	assert(type(baseUrl) == "string", "baseUrl must be a string")
+	options = options or {}
+	assert(type(options) == "table", "options must be a table")
+	assert(
+		options.connectTimeoutSeconds == nil
+			or (
+				type(options.connectTimeoutSeconds) == "number"
+				and options.connectTimeoutSeconds > 0
+				and options.connectTimeoutSeconds % 1 == 0
+			),
+		"options.connectTimeoutSeconds must be a positive integer"
+	)
+	assert(
+		options.connectRequestLane == nil or type(options.connectRequestLane) == "table",
+		"options.connectRequestLane must be a table"
+	)
 
 	local self = {
 		__baseUrl = baseUrl,
+		__connectRequestLane = options.connectRequestLane,
+		__connectTimeoutSeconds = options.connectTimeoutSeconds,
 		__sessionId = nil,
 		__messageCursor = -1,
 		__wsClient = nil,
@@ -119,11 +140,12 @@ end
 
 function ApiContext:disconnect()
 	self.__connected = false
-	for request in self.__activeRequests do
+	local activeRequests = self.__activeRequests
+	self.__activeRequests = {}
+	for request in activeRequests do
 		Log.trace("Cancelling request {}", request)
 		request:cancel()
 	end
-	self.__activeRequests = {}
 
 	if self.__wsClient then
 		Log.trace("Closing WebSocket client")
@@ -132,15 +154,50 @@ function ApiContext:disconnect()
 	self.__wsClient = nil
 end
 
+function ApiContext:__trackRequest(request)
+	self.__activeRequests[request] = true
+	request
+		:finally(function()
+			self.__activeRequests[request] = nil
+		end)
+		:catch(function() end)
+
+	return request
+end
+
+function ApiContext:__continueIfConnected(value)
+	if not self.__connected then
+		return Promise.reject(disconnectedError())
+	end
+
+	return value
+end
+
+function ApiContext:finishConnecting()
+	-- Setup requests share one lane with replacement metadata probes. Connected
+	-- session traffic does not need this serialization.
+	self.__connectRequestLane = nil
+end
+
 function ApiContext:setMessageCursor(index)
 	self.__messageCursor = index
 end
 
 function ApiContext:connect()
+	if not self.__connected then
+		return Promise.reject(disconnectedError())
+	end
+
 	local url = ("%s/api/rojo"):format(self.__baseUrl)
 
-	return Http.get(url)
+	return self:__trackRequest(Http.get(url, {
+		requestLane = self.__connectRequestLane,
+		timeoutSeconds = self.__connectTimeoutSeconds,
+	})
 		:catch(rejectTransportError)
+		:andThen(function(response)
+			return self:__continueIfConnected(response)
+		end)
 		:andThen(Http.Response.msgpack)
 		:andThen(rejectWrongProtocolVersion)
 		:andThen(function(body)
@@ -150,19 +207,35 @@ function ApiContext:connect()
 		end)
 		:andThen(rejectWrongPlaceId)
 		:andThen(function(body)
+			local connectedBody = self:__continueIfConnected(body)
+			if Promise.is(connectedBody) then
+				return connectedBody
+			end
+
 			self.__sessionId = body.sessionId
 
 			return body
-		end)
+		end))
 end
 
 function ApiContext:read(ids)
+	if not self.__connected then
+		return Promise.reject(disconnectedError())
+	end
+
 	local url = ("%s/api/read/%s"):format(self.__baseUrl, table.concat(ids, ","))
 
-	return Http.get(url)
+	return self:__trackRequest(Http.get(url, {
+		requestLane = self.__connectRequestLane,
+	})
 		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(body)
+			local connectedBody = self:__continueIfConnected(body)
+			if Promise.is(connectedBody) then
+				return connectedBody
+			end
+
 			if body.sessionId ~= self.__sessionId then
 				return Promise.reject("Server changed ID")
 			end
@@ -170,10 +243,14 @@ function ApiContext:read(ids)
 			assert(validateApiRead(body))
 
 			return body
-		end)
+		end))
 end
 
 function ApiContext:write(patch)
+	if not self.__connected then
+		return Promise.reject(disconnectedError())
+	end
+
 	local url = ("%s/api/write"):format(self.__baseUrl)
 
 	local updated = {}
@@ -207,14 +284,21 @@ function ApiContext:write(patch)
 
 	body = Http.msgpackEncode(body)
 
-	return Http.post(url, body)
+	return self:__trackRequest(Http.post(url, body, {
+		requestLane = self.__connectRequestLane,
+	})
 		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(responseBody)
+			local connectedBody = self:__continueIfConnected(responseBody)
+			if Promise.is(connectedBody) then
+				return connectedBody
+			end
+
 			Log.info("Write response: {:?}", responseBody)
 
 			return responseBody
-		end)
+		end))
 end
 
 function ApiContext:connectWebSocket(packetHandlers)
@@ -222,7 +306,16 @@ function ApiContext:connectWebSocket(packetHandlers)
 	-- Convert HTTP/HTTPS URL to WS/WSS
 	url = url:gsub("^http://", "ws://"):gsub("^https://", "wss://")
 
-	return Promise.new(function(resolve, reject)
+	if not self.__connected then
+		return Promise.reject(disconnectedError())
+	end
+
+	return self:__trackRequest(Promise.new(function(resolve, reject)
+		if not self.__connected then
+			reject(disconnectedError())
+			return
+		end
+
 		local success, wsClient =
 			pcall(HttpService.CreateWebStreamClient, HttpService, Enum.WebStreamClientType.WebSocket, {
 				Url = url,
@@ -241,6 +334,10 @@ function ApiContext:connectWebSocket(packetHandlers)
 		local closed, errored, received
 
 		received = self.__wsClient.MessageReceived:Connect(function(msg)
+			if not self.__connected then
+				return
+			end
+
 			local data = Http.msgpackDecode(msg)
 			if data.sessionId ~= self.__sessionId then
 				Log.warn("Received message with wrong session ID; ignoring")
@@ -284,39 +381,65 @@ function ApiContext:connectWebSocket(packetHandlers)
 			errored:Disconnect()
 			received:Disconnect()
 
-			reject(
-				ConnectionError.retryable(
-					ConnectionError.Kind.WebSocketTransport,
-					"WebSocket error: " .. code .. " - " .. msg
+			if self.__connected then
+				reject(
+					ConnectionError.retryable(
+						ConnectionError.Kind.WebSocketTransport,
+						"WebSocket error: " .. code .. " - " .. msg
+					)
 				)
-			)
+			else
+				resolve()
+			end
 		end)
-	end)
+	end))
 end
 
 function ApiContext:open(id)
+	if not self.__connected then
+		return Promise.reject(disconnectedError())
+	end
+
 	local url = ("%s/api/open/%s"):format(self.__baseUrl, id)
 
-	return Http.post(url, "")
+	return self:__trackRequest(Http.post(url, "", {
+		requestLane = self.__connectRequestLane,
+	})
 		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(body)
+			local connectedBody = self:__continueIfConnected(body)
+			if Promise.is(connectedBody) then
+				return connectedBody
+			end
+
 			if body.sessionId ~= self.__sessionId then
 				return Promise.reject("Server changed ID")
 			end
 
 			return nil
-		end)
+		end))
 end
 
 function ApiContext:serialize(ids: { string })
+	if not self.__connected then
+		return Promise.reject(disconnectedError())
+	end
+
 	local url = ("%s/api/serialize"):format(self.__baseUrl)
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
-	return Http.post(url, request_body)
+	return self:__trackRequest(Http.post(url, request_body, {
+		requestLane = self.__connectRequestLane,
+	})
 		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(response_body)
+			local connectedBody = self:__continueIfConnected(response_body)
+			if Promise.is(connectedBody) then
+				return connectedBody
+			end
+
 			if response_body.sessionId ~= self.__sessionId then
 				return Promise.reject("Server changed ID")
 			end
@@ -324,17 +447,28 @@ function ApiContext:serialize(ids: { string })
 			assert(validateApiSerialize(response_body))
 
 			return response_body
-		end)
+		end))
 end
 
 function ApiContext:refPatch(ids: { string })
+	if not self.__connected then
+		return Promise.reject(disconnectedError())
+	end
+
 	local url = ("%s/api/ref-patch"):format(self.__baseUrl)
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
-	return Http.post(url, request_body)
+	return self:__trackRequest(Http.post(url, request_body, {
+		requestLane = self.__connectRequestLane,
+	})
 		:catch(rejectTransportError)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(response_body)
+			local connectedBody = self:__continueIfConnected(response_body)
+			if Promise.is(connectedBody) then
+				return connectedBody
+			end
+
 			if response_body.sessionId ~= self.__sessionId then
 				return Promise.reject("Server changed ID")
 			end
@@ -342,7 +476,7 @@ function ApiContext:refPatch(ids: { string })
 			assert(validateApiRefPatch(response_body))
 
 			return response_body
-		end)
+		end))
 end
 
 return ApiContext

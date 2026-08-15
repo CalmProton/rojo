@@ -5,8 +5,12 @@ return function()
 		local scheduled = {}
 		local cancelled = {}
 		local attempts = {}
+		local now = 0
 		local controller = ReconnectController.new({
 			delaySeconds = 5,
+			clock = function()
+				return now
+			end,
 			delay = function(seconds, callback)
 				local timer = {
 					seconds = seconds,
@@ -23,7 +27,9 @@ return function()
 			end,
 		})
 
-		return controller, scheduled, cancelled, attempts
+		return controller, scheduled, cancelled, attempts, function(value)
+			now = value
+		end
 	end
 
 	it("waits five seconds before one connection attempt", function()
@@ -56,6 +62,36 @@ return function()
 		expect(controller:attemptFailed(target)).to.equal(true)
 		expect(#scheduled).to.equal(3)
 		expect(#attempts).to.equal(2)
+	end)
+
+	it("keeps attempt starts on a five-second cadence", function()
+		local controller, scheduled, _, _, setNow = createHarness()
+		local target = { key = "localhost:34872" }
+
+		controller:schedule(target)
+		setNow(5)
+		scheduled[1].callback()
+		setNow(7)
+		local scheduledRetry, delaySeconds = controller:attemptFailed(target)
+
+		expect(scheduledRetry).to.equal(true)
+		expect(delaySeconds).to.equal(3)
+		expect(scheduled[2].seconds).to.equal(3)
+	end)
+
+	it("does not add a delay after an attempt reaches the deadline", function()
+		local controller, scheduled, _, _, setNow = createHarness()
+		local target = { key = "localhost:34872" }
+
+		controller:schedule(target)
+		setNow(5)
+		scheduled[1].callback()
+		setNow(10)
+		local scheduledRetry, delaySeconds = controller:attemptFailed(target)
+
+		expect(scheduledRetry).to.equal(true)
+		expect(delaySeconds).to.equal(0)
+		expect(scheduled[2].seconds).to.equal(0)
 	end)
 
 	it("cancels a pending timer", function()
