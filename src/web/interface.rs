@@ -42,7 +42,11 @@ impl<'a> SubscribeMessage<'a> {
 
         let mut added = HashMap::new();
         for id in patch.added {
-            let instance = tree.get_instance(id).unwrap();
+            // The tree can contain newer changes than this queued patch. A
+            // later patch can remove this instance before serialization.
+            let Some(instance) = tree.get_instance(id) else {
+                continue;
+            };
             added.insert(id, Instance::from_rojo_instance(instance));
 
             for instance in tree.descendants(id) {
@@ -311,4 +315,30 @@ pub enum ErrorResponseKind {
     BadRequest,
     Forbidden,
     InternalError,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::InstanceSnapshot;
+
+    #[test]
+    fn omits_added_instances_removed_from_current_tree() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root_id = tree.get_root_id();
+        let removed_id = tree.insert_instance(root_id, InstanceSnapshot::new().name("Removed"));
+        let retained_id = tree.insert_instance(root_id, InstanceSnapshot::new().name("Retained"));
+        tree.remove(removed_id);
+
+        let patch = AppliedPatchSet {
+            added: vec![removed_id, retained_id],
+            ..Default::default()
+        };
+
+        let message = SubscribeMessage::from_patch_update(&tree, patch);
+
+        assert_eq!(message.added.len(), 1);
+        assert!(!message.added.contains_key(&removed_id));
+        assert!(message.added.contains_key(&retained_id));
+    }
 }

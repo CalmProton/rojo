@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Fixed `rojo serve` crashing when an instance from an earlier queued addition no longer exists in the current tree.
 * Fixed the Studio plugin requiring a manual reconnect after an unexpected WebSocket connection failure.
 * Fixed `rojo serve` crashing when a recursive directory removal reports a descendant after its parent is gone.
 * Fixed `$path` values that point outside the project folder failing to match `syncRule`s on Windows, which broke `rojo sourcemap` with a "could not be turned into a Roblox Instance" error. ([#1290])
