@@ -3,6 +3,6 @@ local Version = require(script.Parent.Version)
 
 local Branding = {}
 
-Branding.displayName = string.format("Rojo %s — Blokblok Auto-Reconnect", Version.display(Config.version))
+Branding.displayName = string.format("Rojo %s - BlokBlok Fork", Version.display(Config.version))
 
 return Branding
